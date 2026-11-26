@@ -40,6 +40,11 @@ def current_user(token: str = Depends(bearer)):
         raise HTTPException(401, '登录已失效，请重新登录') from None
 
 
+def authenticated(user=Depends(current_user)):
+    """任意已登录角色，返回用户名（供审计记录）。"""
+    return user['sub']
+
+
 def operator(user=Depends(current_user)):
     if user['role'] != Role.OPERATOR:
         raise HTTPException(403, '需要经办员权限')

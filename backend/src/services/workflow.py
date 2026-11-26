@@ -6,8 +6,8 @@ from sqlalchemy import and_, or_, select
 
 from src.config.settings import cache, engine
 from src.constants.workflow import Status
-from src.models.tables import audit, cases, evidence, runs
-from src.services import domain
+from src.models.tables import audit, cases, evidence, restored_batches, runs
+from src.services import domain, recovery
 from src.utils.encoding import canonical
 from src.utils.time import utc_time
 
@@ -102,3 +102,54 @@ def review(identity, note, actor):
             raise HTTPException(409, '该证据已经复核')
         log(conn, actor, 'review', identity)
         return found(conn, evidence, identity)
+
+
+def backup_evidence(identity, actor):
+    """导出已签批次的离线备份包及档案岗另存的校验凭据（两者分离）。"""
+    with engine.begin() as conn:
+        row = found(conn, evidence, identity)
+        if not row.get('reviewed_at'):
+            raise HTTPException(409, '该批次尚未经复核员签署，不能备份')
+        try:
+            bundle = recovery.build_bundle(row)
+        except recovery.RecoveryError as exc:
+            raise HTTPException(422, str(exc)) from None
+        log(conn, actor, 'backup_batch', identity)
+    return bundle, recovery.root_digest(bundle)
+
+
+def restore_backup(bundle, credential, actor):
+    if not isinstance(bundle, dict):
+        raise HTTPException(422, '备份包须为 JSON 对象')
+    try:
+        restored_id, batch_id, schema_name = recovery.restore_bundle(
+            engine, bundle, credential, actor, restored_batches, log)
+    except recovery.RecoveryError as exc:
+        raise HTTPException(422, str(exc)) from None
+    return {'id': restored_id, 'batch_id': batch_id, 'schema_name': schema_name,
+            'status': recovery.ACTIVE}
+
+
+def list_restored():
+    with engine.connect() as conn:
+        return [dict(row) for row in conn.execute(
+            restored_batches.select().order_by(restored_batches.c.id.desc())
+            .limit(100)).mappings().all()]
+
+
+def current_restored():
+    with engine.connect() as conn:
+        batch = recovery.active_batch(conn, restored_batches)
+        if batch is None:
+            return None
+        batch['partitions'] = recovery.read_partitions(conn, batch)
+        return batch
+
+
+def restored_slips(identity, kind):
+    with engine.connect() as conn:
+        batch = found(conn, restored_batches, identity)
+        try:
+            return recovery.read_slips(conn, batch, kind)
+        except recovery.RecoveryError as exc:
+            raise HTTPException(422, str(exc)) from None
